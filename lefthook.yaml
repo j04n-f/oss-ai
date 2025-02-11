@@ -1,0 +1,4 @@
+pre-commit:
+  commands:
+    ci:
+      run: pnpm turbo run check-types format:ci

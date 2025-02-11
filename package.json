@@ -1,0 +1,22 @@
+{
+    "name": "oss-ai",
+    "private": true,
+    "scripts": {
+        "build": "turbo build",
+        "dev": "turbo dev",
+        "format": "biome check .",
+        "format:fix": "biome check . --write",
+        "format:ci": "biome ci .",
+        "check:ci": "turbo run check-types _format:ci"
+    },
+    "devDependencies": {
+        "@biomejs/biome": "1.9.4",
+        "lefthook": "^1.10.10",
+        "turbo": "^2.4.1",
+        "typescript": "5.7.3"
+    },
+    "packageManager": "pnpm@10.2.0",
+    "engines": {
+        "node": ">=22"
+    }
+}
