@@ -1,5 +1,6 @@
+import { PostgresDatabaseAdapter } from '@elizaos/adapter-postgres';
 import { RedisClient } from '@elizaos/adapter-redis';
-import { SupabaseDatabaseAdapter } from '@elizaos/adapter-supabase';
+import { DirectClient } from '@elizaos/client-direct';
 import {
     AgentRuntime,
     CacheManager,
@@ -8,8 +9,8 @@ import {
     type ICacheManager,
     type IDatabaseAdapter,
     elizaLogger,
-    settings,
 } from '@elizaos/core';
+import { defaultCharacter } from './characters/default';
 
 const createAgent = async (
     character: Character,
@@ -34,24 +35,28 @@ const createAgent = async (
     });
 };
 
+type Optional<T> = T | undefined;
+
 const initializeDatabase = () => {
-    elizaLogger.info('Initializing Supabase connection...');
+    elizaLogger.info('Initializing PostgreSQL connection...');
 
-    const supabaseUrl = process.env.SUPABASE_URL;
-    const supabaseKey = process.env.SUPABASE_ANON_KEY;
+    const postgresUrl = process.env.POSTGRES_URL;
 
-    if (!supabaseUrl || !supabaseKey) {
-        throw new Error('SUPABASE_URL or SUPABASE_ANON_KEY environment variable is not set');
+    if (!postgresUrl) {
+        throw new Error('POSTGRES_URL environment variable is not set');
     }
 
-    const db = new SupabaseDatabaseAdapter(supabaseUrl, supabaseKey);
+    const db = new PostgresDatabaseAdapter({
+        connectionString: process.env.POSTGRES_URL,
+        parseInputs: true,
+    });
 
     db.init()
         .then(() => {
-            elizaLogger.success('Successfully connected to Supabase database');
+            elizaLogger.success('Successfully connected to PostgreSQL database');
         })
         .catch((error) => {
-            elizaLogger.error('Failed to connect to Supabase:', error);
+            elizaLogger.error('Failed to connect to PostgreSQL:', error);
         });
 
     return db;
@@ -75,28 +80,73 @@ const initializeCache = (character: Character) => {
     return new CacheManager(new DbCacheAdapter(redisClient, character.id));
 };
 
-const startAgent = async (character: Character) => {
-    const token = process.env.OPENAI_API_KEY;
+const startAgent = async (character: Character, directClient: DirectClient) => {
+    let db: Optional<PostgresDatabaseAdapter>;
 
-    if (!token) {
-        throw new Error('OPENAI_API_KEY environment variable is not set');
+    try {
+        const token = process.env.OPENAI_API_KEY;
+
+        if (!token) {
+            throw new Error('OPENAI_API_KEY environment variable is not set');
+        }
+
+        db = initializeDatabase();
+
+        await db.init();
+
+        const cache = initializeCache(character);
+
+        const runtime: AgentRuntime = await createAgent(character, db, cache, token);
+
+        await runtime.initialize();
+
+        directClient.registerAgent(runtime);
+
+        elizaLogger.debug(`Started ${character.name} as ${runtime.agentId}`);
+
+        return runtime;
+    } catch (error) {
+        elizaLogger.error(`Error starting agent for character ${character.name}:`, error);
+        elizaLogger.error(error);
+
+        if (db) {
+            await db.close();
+        }
+
+        throw error;
     }
-
-    const db = initializeDatabase();
-
-    await db.init();
-
-    const cache = initializeCache(character);
-
-    const runtime: AgentRuntime = await createAgent(character, db, cache, token);
-
-    await runtime.initialize();
 };
 
 const startAgents = async () => {
-    const characters: Character[] = [];
+    const directClient = new DirectClient();
+    const characters: Character[] = [defaultCharacter];
 
-    for (const character of characters) {
-        await startAgent(character);
+    try {
+        for (const character of characters) {
+            await startAgent(character, directClient);
+        }
+    } catch (error) {
+        elizaLogger.error('Error starting agents:', error);
     }
+
+    directClient.startAgent = async (character: Character) => {
+        return startAgent(character, directClient);
+    };
+
+    directClient.start(3000);
+
+    elizaLogger.log('iAgent up & running');
 };
+
+startAgents().catch((error) => {
+    elizaLogger.error('Unhandled error in startAgents:', error);
+    process.exit(1);
+});
+
+process.on('uncaughtException', (err) => {
+    console.error('uncaughtException', err);
+});
+
+process.on('unhandledRejection', (err) => {
+    console.error('unhandledRejection', err);
+});

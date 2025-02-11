@@ -2,6 +2,8 @@ import { type Character, ModelProviderName } from '@elizaos/core';
 
 export const defaultCharacter: Character = {
     name: 'Juliette',
+    username: 'Juliette',
+    id: '9041d85f-0c67-4f26-a9db-2e6e1de7cb16',
     plugins: [],
     clients: [],
     modelProvider: ModelProviderName.OPENAI,
