@@ -1,6 +1,5 @@
-import { PostgresDatabaseAdapter } from '@elizaos/adapter-postgres';
-import { RedisClient } from '@elizaos/adapter-redis';
-import { DirectClient } from '@elizaos/client-direct';
+import http from 'node:http';
+import { PostgresDatabaseAdapter as Postgres } from '@elizaos/adapter-postgres';
 import {
     AgentRuntime,
     CacheManager,
@@ -10,7 +9,9 @@ import {
     type IDatabaseAdapter,
     elizaLogger,
 } from '@elizaos/core';
+import { GitHubClient } from '@repo/client-github';
 import { defaultCharacter } from './characters/default';
+import { type AgentSettings, loadSettings } from './settings';
 
 const createAgent = async (
     character: Character,
@@ -35,23 +36,19 @@ const createAgent = async (
     });
 };
 
-type Optional<T> = T | undefined;
-
-const initializeDatabase = () => {
+const initializeDatabase = async (
+    url: string,
+    character: Character,
+): Promise<[Postgres, CacheManager]> => {
     elizaLogger.info('Initializing PostgreSQL connection...');
 
-    const postgresUrl = process.env.POSTGRES_URL;
-
-    if (!postgresUrl) {
-        throw new Error('POSTGRES_URL environment variable is not set');
-    }
-
-    const db = new PostgresDatabaseAdapter({
-        connectionString: process.env.POSTGRES_URL,
+    const db = new Postgres({
+        connectionString: url,
         parseInputs: true,
     });
 
-    db.init()
+    await db
+        .init()
         .then(() => {
             elizaLogger.success('Successfully connected to PostgreSQL database');
         })
@@ -59,89 +56,77 @@ const initializeDatabase = () => {
             elizaLogger.error('Failed to connect to PostgreSQL:', error);
         });
 
-    return db;
-};
-
-const initializeCache = (character: Character) => {
-    const redisUrl = process.env.REDIS_URL;
-
-    if (!redisUrl) {
-        throw new Error('REDIS_URL environment variable is not set');
-    }
-
-    elizaLogger.info('Connecting to Redis...');
-
-    const redisClient = new RedisClient(redisUrl);
+    elizaLogger.info('Using Database Cache...');
 
     if (!character?.id) {
-        throw new Error('CacheStore.REDIS requires id to be set in character definition');
+        throw new Error('Postgres Cache requires id to be set in character definition');
     }
 
-    return new CacheManager(new DbCacheAdapter(redisClient, character.id));
+    const cache = new CacheManager(new DbCacheAdapter(db, character.id));
+
+    return [db, cache];
 };
 
-const startAgent = async (character: Character, directClient: DirectClient) => {
-    let db: Optional<PostgresDatabaseAdapter>;
+const startRuntime = async (
+    db: Postgres,
+    cache: CacheManager,
+    token: string,
+    character: Character,
+    githubClient: GitHubClient,
+) => {
+    const runtime: AgentRuntime = await createAgent(character, db, cache, token);
 
-    try {
-        const token = process.env.OPENAI_API_KEY;
+    await runtime.initialize();
 
-        if (!token) {
-            throw new Error('OPENAI_API_KEY environment variable is not set');
-        }
+    githubClient.registerAgent(runtime);
 
-        db = initializeDatabase();
+    return runtime;
+};
 
-        await db.init();
+const startAgent = async (
+    settings: AgentSettings,
+    character: Character,
+    githubClient: GitHubClient,
+) => {
+    const [db, cache] = await initializeDatabase(settings.POSTGRES_URL, character);
 
-        const cache = initializeCache(character);
-
-        const runtime: AgentRuntime = await createAgent(character, db, cache, token);
-
-        await runtime.initialize();
-
-        directClient.registerAgent(runtime);
-
-        elizaLogger.debug(`Started ${character.name} as ${runtime.agentId}`);
-
-        return runtime;
-    } catch (error) {
-        elizaLogger.error(`Error starting agent for character ${character.name}:`, error);
-        elizaLogger.error(error);
-
-        if (db) {
-            await db.close();
-        }
-
-        throw error;
-    }
+    return startRuntime(db, cache, settings.OPENAI_TOKEN, character, githubClient).catch(
+        (error) => {
+            db.close();
+            throw error;
+        },
+    );
 };
 
 const startAgents = async () => {
-    const directClient = new DirectClient();
+    const settings = await loadSettings();
+
+    const githubClient = new GitHubClient(
+        settings.GITHUB_APP_ID,
+        settings.GITHUB_APP_KEY,
+        settings.GITHUB_WEBHOOK_SECRET,
+    );
+
     const characters: Character[] = [defaultCharacter];
 
-    try {
-        for (const character of characters) {
-            await startAgent(character, directClient);
-        }
-    } catch (error) {
-        elizaLogger.error('Error starting agents:', error);
+    for (const character of characters) {
+        await startAgent(settings, character, githubClient)
+            .then((runtime) => {
+                elizaLogger.debug(`Started ${character.name} as ${runtime.agentId}`);
+            })
+            .catch((error) => {
+                elizaLogger.error(`Error starting Character ${character.name}:`, error);
+            });
     }
 
-    directClient.startAgent = async (character: Character) => {
-        return startAgent(character, directClient);
-    };
+    const middleware = githubClient.createMiddleware();
 
-    directClient.start(3000);
-
-    elizaLogger.log('iAgent up & running');
+    http.createServer(middleware).listen(3000, () => {
+        elizaLogger.log('iAgent up & running');
+    });
 };
 
-startAgents().catch((error) => {
-    elizaLogger.error('Unhandled error in startAgents:', error);
-    process.exit(1);
-});
+startAgents().catch(() => process.exit(1));
 
 process.on('uncaughtException', (err) => {
     console.error('uncaughtException', err);
