@@ -1,69 +1,44 @@
 import fs from 'node:fs';
 import {
-    type AgentRuntime,
     type Client,
     type Content,
     type IAgentRuntime,
-    type Memory,
     ModelClass,
-    State,
     composeContext,
     elizaLogger,
     generateMessageResponse,
-    generateText,
-    getEmbeddingZeroVector,
-    messageCompletionFooter,
     stringToUuid,
 } from '@elizaos/core';
+import { Network } from '@injectivelabs/networks';
+import { MsgBroadcasterWithPk, MsgInstantiateContract, PrivateKey } from '@injectivelabs/sdk-ts';
 import { App } from '@octokit/app';
 import type { Octokit } from '@octokit/core';
 import { createNodeMiddleware } from '@octokit/webhooks';
-import type { IssuesOpenedEvent } from '@octokit/webhooks-types';
-import cors from 'cors';
-import express from 'express';
+import type {
+    DiscussionCreatedEvent,
+    InstallationLite,
+    IssuesOpenedEvent,
+} from '@octokit/webhooks-types';
+import dedent from 'dedent';
+import { DiscussionsClient, IssuesClient, ReposClient } from './clients';
 import { type AppSettings, loadSettings } from './settings';
+import { discussionClosedTemplate } from './templates/discussion-closed';
+import { issueOpenedTemplate } from './templates/issue-opened';
 
-// TODO: use {{knowledge}} template when fixed
-export const issueOpenedTemplate = `
-# Knowledge
-Common type labels names: bug, documentation, duplicate, enhancement, good first issue, help wanted, invalid, question, wontfix
-Common priority labels names: high, medium, low, critical, blocking
-Best practices for issue triage: categorize issues, verify reproducibility, assign relevant labels, and prioritize based on impact
-Key principles of open-source product management: transparency, asynchronous communication, and contributor empowerment
-
-# Background
-About {{agentName}}:
-{{bio}}
-{{lore}}
-
-# Attachments
-{{attachments}}
-
-# Capabilities
-Note that {{agentName}} is capable of reading/seeing/hearing various forms of media, including images, videos, audio, plaintext and PDFs. Recent attachments have been included above under the "Attachments" section.
-
-{{messageDirections}}
-
-# Task: Triage a the following Github Issue by defining the priority and type label taking into account the {{agentName}} experience as Product Manager.
-
-## Issue Title
-{{title}}
-
-## Issue Body
-{{body}}
-
-# Instructions: Define the issue priority and type label depending on the issue title, description and label description. The available labels are (label_name: label_description): 
-
-{{labels}}
-
-# Response: The response must be ONLY a JSON containin the issue priority and lable. Response format should be formatted in a valid JSON block like this:
-
-\`\`\`json\n{ "priority": "high", "type": "bug" }\n\`\`\`
-`;
+const network: Network = Network.Testnet;
 
 export class GitHubClient {
     private readonly app: App;
+
     private readonly clients: Map<number, { octokit: Octokit; expiration: number }>;
+
+    private readonly codeId: number;
+
+    private readonly privateKey: PrivateKey;
+
+    issues: IssuesClient;
+    repos: ReposClient;
+    discussions: DiscussionsClient;
 
     constructor(
         private readonly agent: IAgentRuntime,
@@ -81,11 +56,20 @@ export class GitHubClient {
 
         this.clients = new Map();
 
+        this.repos = new ReposClient(this);
+        this.issues = new IssuesClient(this);
+        this.discussions = new DiscussionsClient(this);
+
         this.app.webhooks.on('issues.opened', this.handleOpenIssue.bind(this));
+        this.app.webhooks.on('discussion.closed', this.handleClosedDiscussion.bind(this));
 
         this.app.webhooks.onError((error) => {
             elizaLogger.error('Error processing the Github Webhook:', error);
         });
+
+        this.codeId = Number(settings.CODE_ID);
+
+        this.privateKey = PrivateKey.fromMnemonic(settings.MNEMONIC);
     }
 
     public async retriveInstallations() {
@@ -108,7 +92,7 @@ export class GitHubClient {
         return client;
     }
 
-    private async getOctokitClient(id: number) {
+    public async getOctokitClient(id: number) {
         let client = this.clients.get(id);
 
         if (!client) {
@@ -122,24 +106,141 @@ export class GitHubClient {
         return client.octokit;
     }
 
-    private async handleOpenIssue({ payload }: { payload: object }) {
-        const issue = (payload as IssuesOpenedEvent).issue;
-        const repository = (payload as IssuesOpenedEvent).repository;
-        const installation = (payload as IssuesOpenedEvent).installation;
+    private async handleClosedDiscussion({ payload }: { payload: object }) {
+        const discussion = (payload as DiscussionCreatedEvent).discussion;
+        const repository = (payload as DiscussionCreatedEvent).repository;
+
+        const installation = getInstallation(payload);
 
         const owner = repository.owner.login;
         const repo = repository.name;
 
-        if (!installation) {
-            throw new Error('Missing repository GithubApp installation');
-        }
-
-        const octokit = await this.getOctokitClient(installation.id);
-
-        const res = await octokit.request('GET /repos/{owner}/{repo}/labels', {
+        const comments = await this.discussions.getComments(
+            installation.id,
             owner,
             repo,
+            discussion.number,
+        );
+
+        const roomId = stringToUuid(`github-discussion-${discussion.id}-room`);
+        const userId = stringToUuid(discussion.user.id);
+
+        this.agent.ensureConnection(
+            userId,
+            roomId,
+            discussion.user.name,
+            discussion.user.name,
+            'github',
+        );
+
+        const discussionContent = `${discussion.title}\n${discussion.body}\n${comments.map((comment) => comment.body).join('\n')}`;
+
+        const content: Content = {
+            text: discussionContent,
+            source: 'github',
+            url: discussion.html_url,
+            inReplyTo: undefined,
+        };
+
+        const userMessage = {
+            content,
+            userId,
+            roomId,
+            agentId: this.agent.agentId,
+        };
+
+        const state = await this.agent.composeState(userMessage, {
+            agentName: this.agent.character.name,
+            title: discussion.title,
+            body: discussion.body,
+            comments: comments.map((comment) => comment.body).join('\n'),
         });
+
+        const context = composeContext({
+            state,
+            template: discussionClosedTemplate,
+        });
+
+        const response = await generateMessageResponse({
+            runtime: this.agent,
+            context,
+            modelClass: ModelClass.LARGE,
+        });
+
+        const features = response.features as { name: string; description: string }[];
+
+        const msg = MsgInstantiateContract.fromJSON({
+            sender: this.privateKey.toBech32(),
+            admin: '',
+            codeId: this.codeId,
+            msg: {
+                candidates: features.map((feature) => feature.name),
+                deadline: Date.now() + 1000 * 60 * 60 * 24,
+            },
+            label: 'VoteContract',
+            amount: {
+                denom: 'inj',
+                amount: '1000',
+            },
+        });
+
+        const msgBroadcastClient = new MsgBroadcasterWithPk({
+            privateKey: this.privateKey,
+            network: network,
+        });
+
+        const res = await msgBroadcastClient.broadcast({
+            msgs: msg,
+        });
+
+        const created_event = res.events?.filter(
+            (event) => event.type === 'cosmwasm.wasm.v1.EventContractInstantiated',
+        )[0];
+        const created_attribute = created_event.attributes.filter(
+            (attribute: { key: string }) => attribute.key === 'contract_address',
+        )[0];
+
+        const contract_address = created_attribute.value as string;
+
+        try {
+            const body = dedent`
+            ## Summary
+
+            ${response.summary}
+
+            ## Vote
+
+            | Fetaure                      | Description                         | Vote                                          | Votes  |
+            | ---------------------------- | ----------------------------------- | --------------------------------------------- | ------ |
+            | ${features[0].name} | ${features[0].description} | [Click here](http://localhost:4321/sign-vote?address=${contract_address.replace(/['"]+/g, '')}&candidate=${encodeURIComponent(features[0].name.trim())}) |  # (0) |
+            | ${features[1].name} | ${features[1].description} | [Click here](http://localhost:4321/sign-vote?address=${contract_address.replace(/['"]+/g, '')}&candidate=${encodeURIComponent(features[1].name.trim())}) |  # (0) |
+            | ${features[2].name} | ${features[2].description} | [Click here](http://localhost:4321/sign-vote?address=${contract_address.replace(/['"]+/g, '')}&candidate=${encodeURIComponent(features[2].name.trim())}) |  # (0) |
+            | ${features[3].name} | ${features[3].description} | [Click here](http://localhost:4321/sign-vote?address=${contract_address.replace(/['"]+/g, '')}&candidate=${encodeURIComponent(features[3].name.trim())}) |  # (0) |
+            | ${features[4].name} | ${features[4].description} | [Click here](http://localhost:4321/sign-vote?address=${contract_address.replace(/['"]+/g, '')}&candidate=${encodeURIComponent(features[4].name.trim())}) |  # (0) |
+            `;
+
+            await this.discussions.create(
+                installation.id,
+                repository.node_id,
+                discussion.category.node_id,
+                'Time to Vote!',
+                body,
+            );
+        } catch (err) {
+            elizaLogger.error('Failed to generate voting discussion:', err);
+        }
+    }
+
+    private async handleOpenIssue({ payload }: { payload: object }) {
+        const issue = (payload as IssuesOpenedEvent).issue;
+        const repository = (payload as IssuesOpenedEvent).repository;
+
+        const installation = getInstallation(payload);
+
+        const owner = repository.owner.login;
+        const repo = repository.name;
+
+        const res = await this.repos.getLabels(installation.id, owner, repo);
 
         const labels = res.data.reduce(
             (content, label) =>
@@ -151,8 +252,6 @@ export class GitHubClient {
         const userId = stringToUuid(issue.user.id);
 
         this.agent.ensureConnection(userId, roomId, issue.user.name, issue.user.name, 'github');
-
-        const messageId = stringToUuid(`issues-opened-${Date.now().toString()}`);
 
         const issueContent = `${issue.title}\n${issue.body}`;
 
@@ -170,20 +269,10 @@ export class GitHubClient {
             agentId: this.agent.agentId,
         };
 
-        const memory: Memory = {
-            id: stringToUuid(`${messageId}-${userId}`),
-            ...userMessage,
-            agentId: this.agent.agentId,
-            userId,
-            roomId,
-            content,
-            createdAt: Date.now(),
-        };
+        // TODO: Repository Code as Context
+        // TODO: Closed Issues as examples
 
-        await this.agent.messageManager.addEmbeddingToMemory(memory);
-        await this.agent.messageManager.createMemory(memory);
-
-        let state = await this.agent.composeState(userMessage, {
+        const state = await this.agent.composeState(userMessage, {
             agentName: this.agent.character.name,
             title: issue.title,
             body: issue.body,
@@ -201,29 +290,9 @@ export class GitHubClient {
             modelClass: ModelClass.LARGE,
         });
 
-        const responseMessage: Memory = {
-            id: stringToUuid(`${messageId}-${this.agent.agentId}`),
-            ...userMessage,
-            userId: this.agent.agentId,
-            content: response,
-            embedding: getEmbeddingZeroVector(),
-            createdAt: Date.now(),
-        };
+        const issueLabels = [response.priority as string, response.type as string];
 
-        await this.agent.messageManager.createMemory(responseMessage);
-
-        state = await this.agent.updateRecentMessageState(state);
-
-        await this.agent.evaluate(memory, state);
-
-        elizaLogger.info(response.priority);
-
-        await octokit.request('POST /repos/{owner}/{repo}/issues/{issue_number}/labels', {
-            owner,
-            repo,
-            issue_number: issue.number,
-            labels: [response.priority as string, response.type as string],
-        });
+        this.issues.addLabels(installation.id, owner, repo, issue.number, issueLabels);
     }
 
     public createMiddleware() {
@@ -241,17 +310,6 @@ export const GitHubClientInteface: Client = {
 
         await client.retriveInstallations();
 
-        const app = express();
-
-        app.use(cors());
-
-        //@ts-ignore
-        app.use(client.createMiddleware());
-
-        app.listen(3000, () => {
-            elizaLogger.info('Github Client up & running');
-        });
-
         return client;
     },
 
@@ -259,3 +317,11 @@ export const GitHubClientInteface: Client = {
         elizaLogger.info('GitHub Client stop');
     },
 };
+
+function getInstallation(payload: { installation?: InstallationLite }) {
+    if (!payload.installation) {
+        throw new Error('Missing repository GithubApp installation');
+    }
+
+    return payload.installation;
+}

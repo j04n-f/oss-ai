@@ -8,7 +8,10 @@ import {
     elizaLogger,
 } from '@elizaos/core';
 import { PostgresDatabaseAdapter as Postgres } from '@repo/adapter-postgres';
+import { DirectClient } from '@repo/client-direct';
 import { GitHubClientInteface } from '@repo/client-github';
+import cors from 'cors';
+import express from 'express';
 import { ProductManager } from './characters/ProductManager';
 import { type AgentSettings, loadSettings } from './settings';
 
@@ -16,13 +19,12 @@ const createAgent = async (
     character: Character,
     db: IDatabaseAdapter,
     cache: ICacheManager,
-    token: string,
 ): Promise<AgentRuntime> => {
     elizaLogger.log(`Creating runtime for character ${character.name}`);
 
     return new AgentRuntime({
         databaseAdapter: db,
-        token,
+        token: '',
         modelProvider: character.modelProvider,
         evaluators: [],
         character,
@@ -65,13 +67,8 @@ const initializeDatabase = async (
     return [db, cache];
 };
 
-const startRuntime = async (
-    db: Postgres,
-    cache: CacheManager,
-    token: string,
-    character: Character,
-) => {
-    const runtime: AgentRuntime = await createAgent(character, db, cache, token);
+const startRuntime = async (db: Postgres, cache: CacheManager, character: Character) => {
+    const runtime: AgentRuntime = await createAgent(character, db, cache);
 
     await runtime.initialize();
 
@@ -81,7 +78,7 @@ const startRuntime = async (
 const startAgent = async (settings: AgentSettings, character: Character) => {
     const [db, cache] = await initializeDatabase(settings.POSTGRES_URL, character);
 
-    return startRuntime(db, cache, settings.OPENAI_TOKEN, character).catch((error) => {
+    return startRuntime(db, cache, character).catch((error) => {
         db.close();
         throw error;
     });
@@ -97,12 +94,29 @@ const startAgents = async () => {
 
     elizaLogger.info(`Started ${ProductManager.name} as ${runtime.agentId}`);
 
-    GitHubClientInteface.start(runtime);
+    const githubClient = await GitHubClientInteface.start(runtime);
+    const directClient = new DirectClient();
+
+    const app = express();
+
+    app.use(cors());
+
+    //@ts-ignore
+    app.use(githubClient.createMiddleware());
+
+    app.use(directClient.getRouter());
+
+    app.listen(3000, () => {
+        elizaLogger.info('Github Client up & running');
+    });
 
     elizaLogger.info('iAgent up & running');
 };
 
-startAgents().catch(() => process.exit(1));
+startAgents().catch((err) => {
+    elizaLogger.error(err);
+    process.exit(1);
+});
 
 process.on('uncaughtException', (err) => {
     console.error('uncaughtException', err);

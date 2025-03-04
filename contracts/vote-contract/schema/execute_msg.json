@@ -4,27 +4,17 @@
     "oneOf": [
         {
             "type": "object",
-            "required": ["increment"],
+            "required": ["vote"],
             "properties": {
-                "increment": {
-                    "type": "object"
-                }
-            },
-            "additionalProperties": false
-        },
-        {
-            "type": "object",
-            "required": ["reset"],
-            "properties": {
-                "reset": {
+                "vote": {
                     "type": "object",
-                    "required": ["count"],
+                    "required": ["candidate"],
                     "properties": {
-                        "count": {
-                            "type": "integer",
-                            "format": "int32"
+                        "candidate": {
+                            "type": "string"
                         }
-                    }
+                    },
+                    "additionalProperties": false
                 }
             },
             "additionalProperties": false
