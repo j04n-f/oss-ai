@@ -1,6 +1,6 @@
 # Oss-AI: Revolutionizing the Open Source Business Model
 
-Oss-AI is transforming the way open-source projects are managed and monetized by leveraging AI and blockchain technologies. Our AI-powered agents assist developers in handling the operational challenges of maintaining open-source projects, allowing them to focus on what they love most\u2014coding.
+Oss-AI is transforming the way open-source projects are managed and monetized by leveraging AI and blockchain technologies. Our AI-powered agents assist developers in handling the operational challenges of maintaining open-source projects, allowing them to focus on what they love most - coding.
 
 ## AI-Powered Project Management
 
